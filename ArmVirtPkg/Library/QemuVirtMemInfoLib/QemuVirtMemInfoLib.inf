@@ -27,6 +27,7 @@
   MdePkg/MdePkg.dec
 
 [LibraryClasses]
+  ArmCcaLib
   ArmLib
   BaseMemoryLib
   DebugLib

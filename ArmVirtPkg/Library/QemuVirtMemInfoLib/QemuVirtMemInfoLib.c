@@ -9,14 +9,16 @@
 
 #include <Uefi.h>
 #include <Pi/PiMultiPhase.h>
+#include <Library/ArmCcaLib.h>
 #include <Library/ArmLib.h>
+#include <Library/ArmMmuLib.h>
 #include <Library/BaseMemoryLib.h>
 #include <Library/DebugLib.h>
 #include <Library/HobLib.h>
 #include <Library/MemoryAllocationLib.h>
 
 // Number of Virtual Memory Map Descriptors
-#define MAX_VIRTUAL_MEMORY_MAP_DESCRIPTORS  5
+#define MAX_VIRTUAL_MEMORY_MAP_DESCRIPTORS  7
 
 //
 // mach-virt's core peripherals such as the UART, the GIC and the RTC are
@@ -26,6 +28,20 @@
 //
 #define MACH_VIRT_PERIPH_BASE  0x08000000
 #define MACH_VIRT_PERIPH_SIZE  SIZE_128MB
+//
+// The remaining is mapped lazily, but we need to register the memory
+// attributes now if we're a Realm.
+#define MACH_VIRT_LOWIO_SIZE   (SIZE_1GB - MACH_VIRT_PERIPH_BASE)
+
+// The PCIe and extra redistributor regions are placed after DRAM. These
+// definitions are only correct with less than 256GiB of RAM. Otherwise they are
+// moved up during virt platform creation, aligned on their own size.
+#define MACH_VIRT_GIC_REDIST2_BASE      SIZE_256GB
+#define MACH_VIRT_GIC_REDIST2_SIZE      SIZE_64MB
+#define MACH_VIRT_PCIE_ECAM_BASE        (SIZE_256GB + SIZE_256MB)
+#define MACH_VIRT_PCIE_ECAM_SIZE        SIZE_256MB
+#define MACH_VIRT_PCIE_MMIO_BASE        SIZE_512GB
+#define MACH_VIRT_PCIE_MMIO_SIZE        SIZE_512GB
 
 /**
   Default library constructor that obtains the memory size from a PCD.
@@ -69,6 +85,9 @@ ArmVirtGetMemoryMap (
 {
   ARM_MEMORY_REGION_DESCRIPTOR  *VirtualMemoryTable;
   VOID                          *MemorySizeHob;
+  EFI_STATUS                    Status;
+  UINT64                        IpaWidth = 0;
+  UINT64                        DevMapBit = 0;
 
   ASSERT (VirtualMemoryMap != NULL);
 
@@ -106,10 +125,19 @@ ArmVirtGetMemoryMap (
     VirtualMemoryTable[0].Length
     ));
 
+  if (IsRealm()) {
+    Status = GetIpaWidth(&IpaWidth);
+    if (Status == RETURN_SUCCESS) {
+      DevMapBit = 1ULL << (IpaWidth - 1);
+    } else {
+      DEBUG ((DEBUG_ERROR, "could not get Realm IPA width\n"));
+    }
+  }
+
   // Memory mapped peripherals (UART, RTC, GIC, virtio-mmio, etc)
-  VirtualMemoryTable[1].PhysicalBase = MACH_VIRT_PERIPH_BASE;
+  VirtualMemoryTable[1].PhysicalBase = MACH_VIRT_PERIPH_BASE | DevMapBit;
   VirtualMemoryTable[1].VirtualBase  = MACH_VIRT_PERIPH_BASE;
-  VirtualMemoryTable[1].Length       = MACH_VIRT_PERIPH_SIZE;
+  VirtualMemoryTable[1].Length       = MACH_VIRT_LOWIO_SIZE;
   VirtualMemoryTable[1].Attributes   = ARM_MEMORY_REGION_ATTRIBUTE_DEVICE;
 
   // Map the FV region as normal executable memory
@@ -118,8 +146,33 @@ ArmVirtGetMemoryMap (
   VirtualMemoryTable[2].Length       = FixedPcdGet32 (PcdFvSize);
   VirtualMemoryTable[2].Attributes   = ARM_MEMORY_REGION_ATTRIBUTE_WRITE_BACK_RO;
 
+  // High GIC redistributor region
+  /*
+   * TODO: These regions' base addresses depend on the amount of RAM, when the
+   * VM has more than 256GiB of RAM. Although that may seem like a lot for a
+   * VM, larger amounts are possible regardless of the size of host RAM, because
+   * QEMU allows to create a large address space in order to enable memory
+   * hotplug.
+   */
+  VirtualMemoryTable[3].PhysicalBase = MACH_VIRT_GIC_REDIST2_BASE | DevMapBit;
+  VirtualMemoryTable[3].VirtualBase  = MACH_VIRT_GIC_REDIST2_BASE;
+  VirtualMemoryTable[3].Length       = MACH_VIRT_GIC_REDIST2_SIZE;
+  VirtualMemoryTable[3].Attributes   = ARM_MEMORY_REGION_ATTRIBUTE_DEVICE;
+
+  // High PCIe ECAM region
+  VirtualMemoryTable[4].PhysicalBase = MACH_VIRT_PCIE_ECAM_BASE | DevMapBit;
+  VirtualMemoryTable[4].VirtualBase  = MACH_VIRT_PCIE_ECAM_BASE;
+  VirtualMemoryTable[4].Length       = MACH_VIRT_PCIE_ECAM_SIZE;
+  VirtualMemoryTable[4].Attributes   = ARM_MEMORY_REGION_ATTRIBUTE_DEVICE;
+
+  // High PCIe MMIO region
+  VirtualMemoryTable[5].PhysicalBase = MACH_VIRT_PCIE_MMIO_BASE | DevMapBit;
+  VirtualMemoryTable[5].VirtualBase  = MACH_VIRT_PCIE_MMIO_BASE;
+  VirtualMemoryTable[5].Length       = MACH_VIRT_PCIE_MMIO_SIZE;
+  VirtualMemoryTable[5].Attributes   = ARM_MEMORY_REGION_ATTRIBUTE_DEVICE;
+
   // End of Table
-  ZeroMem (&VirtualMemoryTable[3], sizeof (ARM_MEMORY_REGION_DESCRIPTOR));
+  ZeroMem (&VirtualMemoryTable[6], sizeof (ARM_MEMORY_REGION_DESCRIPTOR));
 
   *VirtualMemoryMap = VirtualMemoryTable;
 }
@@ -141,5 +194,13 @@ ArmCcaConfigureMmio (
   IN UINT64  IpaWidth
   )
 {
-  return RETURN_UNSUPPORTED;
+  if (!IsRealm ()) {
+    return RETURN_UNSUPPORTED;
+  }
+
+  /*
+   * ArmVirtGetMemoryMap() already returned all device mappings with the NS bit
+   * set.
+   */
+  return RETURN_SUCCESS;
 }
