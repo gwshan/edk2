@@ -433,10 +433,14 @@ FillTranslationTable (
   IN  ARM_MEMORY_REGION_DESCRIPTOR  *MemoryRegion
   )
 {
+  UINT64 CcaNsBit = 0;
+
+  CcaNsBit = MemoryRegion->VirtualBase ^ MemoryRegion->PhysicalBase;
+
   return UpdateRegionMapping (
            MemoryRegion->VirtualBase,
            MemoryRegion->Length,
-           ArmMemoryAttributeToPageAttribute (MemoryRegion->Attributes) | TT_AF,
+           ArmMemoryAttributeToPageAttribute (MemoryRegion->Attributes) | TT_AF | CcaNsBit,
            0,
            RootTable,
            FALSE
